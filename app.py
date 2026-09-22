@@ -12,6 +12,7 @@ import requests
 import json
 import like_pb2
 import like_count_pb2
+import visit_count_pb2
 import uid_generator_pb2
 import time
 from collections import defaultdict
@@ -175,22 +176,43 @@ async def check_if_already_liked(target_uid, token, server_name):
         return False
 
 async def send_like(encrypted_uid, token, url):
-    """Send like with token"""
+    """Send a LikeProfile request and return HTTP/response diagnostics.
+
+    The complete project uses Unity-style headers. We keep those headers here
+    because a plain Dalvik header can receive an HTTP 200 without producing the
+    expected in-game like. The response body is only sampled for diagnostics;
+    tokens are never logged.
+    """
     try:
         edata = bytes.fromhex(encrypted_uid)
         headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            'Authorization': f"Bearer {token}",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB55"
+            "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "deflate, gzip",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Unity-Version": "2018.4.12f1",
+            "X-GA": "v1 1",
+            "X-GA-SV": "1789580233",
+            "ReleaseVersion": "OB55"
         }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=edata, headers=headers, timeout=5) as response:
-                return response.status
-    except:
-        return 500
+
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=edata, headers=headers) as response:
+                body = await response.read()
+                return {
+                    "status": response.status,
+                    "body_len": len(body),
+                    "body_hex": body[:32].hex()
+                }
+    except Exception as exc:
+        return {
+            "status": 500,
+            "body_len": 0,
+            "body_hex": "",
+            "error": type(exc).__name__
+        }
 
 async def process_account(target_uid, encrypted_uid, account, url, semaphore, server_name):
     """Process single account with smart checking"""
@@ -204,14 +226,8 @@ async def process_account(target_uid, encrypted_uid, account, url, semaphore, se
             return 500, account['uid']
         
         # Send like
-        status = await send_like(encrypted_uid, token, url)
-        
-        # If successful, mark as liked
-        if status == 200:
-            liked_cache[target_uid].add(account['uid'])
-            return status, account['uid']
-        
-        return status, account['uid']
+        result = await send_like(encrypted_uid, token, url)
+        return result, account['uid']
 
 async def send_all_likes(target_uid, server_name, url):
     """Send likes from all accounts with smart checking"""
@@ -249,19 +265,32 @@ async def send_all_likes(target_uid, server_name, url):
     
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    successful = 0
-    failed = 0
+    successful_http = 0
+    failed_http = 0
+    response_codes = {}
+    diagnostics = []
     for r in results:
         if isinstance(r, tuple):
-            status, uid = r
+            result, uid = r
+            status = result.get("status", 500) if isinstance(result, dict) else 500
+            response_codes[str(status)] = response_codes.get(str(status), 0) + 1
             if status == 200:
-                successful += 1
+                successful_http += 1
             else:
-                failed += 1
-    
+                failed_http += 1
+            if len(diagnostics) < 5:
+                diagnostics.append({
+                    "account": uid,
+                    "http_status": status,
+                    "response_bytes": result.get("body_len", 0) if isinstance(result, dict) else 0,
+                    "response_hex": result.get("body_hex", "") if isinstance(result, dict) else ""
+                })
+
     return {
-        'success': successful,
-        'failed': failed,
+        'success_http': successful_http,
+        'failed_http': failed_http,
+        'response_codes': response_codes,
+        'diagnostics': diagnostics,
         'total': len(accounts),
         'already_liked': len(already_liked),
         'fresh_used': len(fresh_accounts[:50])
@@ -302,7 +331,9 @@ def get_player_info(encrypted_uid, server_name, token):
 
     try:
         response = requests.post(url, data=edata, headers=headers, verify=False, timeout=10)
-        return decode_protobuf(response.content)
+        decoded = visit_count_pb2.Info()
+        decoded.ParseFromString(response.content)
+        return decoded
     except:
         return None
 
@@ -433,10 +464,14 @@ def handle_requests():
             "LikesafterCommand": after_like,
             "LikesbeforeCommand": before_like,
             "VerificationAttempts": verify_attempts,
+            "LikeRequestsHTTP200": result.get("success_http", 0),
+            "LikeRequestsFailed": result.get("failed_http", 0),
+            "LikeResponseCodes": result.get("response_codes", {}),
+            "LikeDiagnostics": result.get("diagnostics", []),
             "PlayerNickname": player_name,
             "UID": player_id,
             "status": status,
-            "remains": f"({remains}/{KEY_LIMIT})",    
+            "remains": f"({remains}/{KEY_LIMIT})",
         })
     except Exception as e:
         return jsonify({"error": str(e), "status": 0}), 500
